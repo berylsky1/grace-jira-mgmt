@@ -144,10 +144,14 @@ class JiraSprintManager:
         return monday, sunday
 
     def _generate_sprint_name(self, start_date: datetime) -> str:
-        """Generate sprint name using ISO week format: Sprint YYYY-WXX"""
+        """Generate sprint name: Postdoc.YYYY.MM.Xth"""
         year = start_date.year
-        week = self._get_iso_week_number(start_date)
-        return f"Sprint {year}-W{week:02d}"
+        month = start_date.month
+        first_of_month = start_date.replace(day=1)
+        week_of_month = (start_date.day - 1 + first_of_month.weekday()) // 7 + 1
+        ordinals = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
+        week_str = ordinals.get(week_of_month, f"{week_of_month}th")
+        return f"Postdoc.{year}.{month:02d}.{week_str}"
 
     def _create_sprint(self, sprint_name: str, start_date: datetime, end_date: datetime) -> Optional[Dict[str, Any]]:
         """Create a new sprint"""
@@ -188,8 +192,55 @@ class JiraSprintManager:
             self.log(f"Failed to create sprint: {e}", "ERROR")
             return None
 
+    def _get_incomplete_issue_keys(self, sprint_id: int) -> list[str]:
+        """Fetch keys of all incomplete (not done) issues in a sprint"""
+        url = f"{self.base_api_url}/sprint/{sprint_id}/issue"
+        issue_keys = []
+        start_at = 0
+
+        while True:
+            try:
+                response = self.session.get(url, params={"startAt": start_at, "maxResults": 100}, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                issues = data.get("issues", [])
+                for issue in issues:
+                    status_category = issue.get("fields", {}).get("status", {}).get("statusCategory", {}).get("key", "")
+                    if status_category != "done":
+                        issue_keys.append(issue["key"])
+                total = data.get("total", 0)
+                start_at += len(issues)
+                if start_at >= total or not issues:
+                    break
+            except requests.RequestException as e:
+                raise RuntimeError(f"Failed to fetch sprint issues: {e}")
+
+        return issue_keys
+
+    def _move_issues_to_sprint(self, sprint_id: int, issue_keys: list[str]) -> bool:
+        """Move a list of issues to a sprint"""
+        if not issue_keys:
+            return True
+
+        url = f"{self.base_api_url}/sprint/{sprint_id}/issue"
+
+        if self.dry_run:
+            self.log(f"DRY RUN: Would move {len(issue_keys)} issue(s): {issue_keys}", "WARN")
+            return True
+
+        for i in range(0, len(issue_keys), 50):
+            batch = issue_keys[i:i + 50]
+            try:
+                response = self.session.post(url, json={"issues": batch}, timeout=10)
+                response.raise_for_status()
+            except requests.RequestException as e:
+                self.log(f"Failed to move issues {batch}: {e}", "ERROR")
+                return False
+
+        return True
+
     def run(self) -> bool:
-        """Execute the sprint rotation: close previous, create new"""
+        """Execute the sprint rotation: close previous, carry over incomplete issues, create new"""
         try:
             self.log("Starting sprint rotation")
             self.log("=" * 70)
@@ -201,6 +252,15 @@ class JiraSprintManager:
             # Get active sprints
             active_sprints = self._get_active_sprints()
 
+            # Collect incomplete issues BEFORE closing
+            incomplete_issue_keys = []
+            if active_sprints:
+                for sprint in active_sprints:
+                    keys = self._get_incomplete_issue_keys(sprint["id"])
+                    incomplete_issue_keys.extend(keys)
+                    self.log(f"Found {len(keys)} incomplete issue(s) in '{sprint['name']}' to carry over")
+
+            # Close active sprints
             if not active_sprints:
                 self.log("No active sprints found. Skipping close step.", "WARN")
             elif len(active_sprints) > 1:
@@ -209,8 +269,7 @@ class JiraSprintManager:
                     if not self._close_sprint(sprint["id"], sprint["name"]):
                         return False
             else:
-                sprint = active_sprints[0]
-                if not self._close_sprint(sprint["id"], sprint["name"]):
+                if not self._close_sprint(active_sprints[0]["id"], active_sprints[0]["name"]):
                     return False
 
             # Create new sprint
@@ -221,6 +280,14 @@ class JiraSprintManager:
             if not new_sprint:
                 return False
 
+            # Move incomplete issues to new sprint
+            if incomplete_issue_keys:
+                self.log(f"Moving {len(incomplete_issue_keys)} incomplete issue(s) to '{sprint_name}'...")
+                if self._move_issues_to_sprint(new_sprint["id"], incomplete_issue_keys):
+                    self.log(f"Successfully carried over {len(incomplete_issue_keys)} issue(s)", "SUCCESS")
+                else:
+                    self.log("Some issues could not be moved — check manually", "WARN")
+
             self.log("=" * 70)
             self.log("Sprint rotation completed successfully!", "SUCCESS")
 
@@ -229,9 +296,10 @@ class JiraSprintManager:
             print("SUMMARY")
             print("=" * 70)
             if active_sprints:
-                print(f"Closed Sprint: {active_sprints[0]['name']}")
-            print(f"New Sprint: {new_sprint['name']}")
-            print(f"Sprint Duration: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+                print(f"Closed Sprint:    {active_sprints[0]['name']}")
+            print(f"New Sprint:       {new_sprint['name']}")
+            print(f"Sprint Duration:  {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            print(f"Carried Over:     {len(incomplete_issue_keys)} issue(s)")
             print("=" * 70 + "\n")
 
             return True

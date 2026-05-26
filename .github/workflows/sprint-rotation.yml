@@ -40,7 +40,7 @@ jobs:
           python scripts/sprint_manager.py
 
       - name: Post to Slack (Optional)
-        if: success()
+        if: success() && secrets.SLACK_WEBHOOK_URL != ''
         uses: slackapi/slack-github-action@v1
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -59,7 +59,7 @@ jobs:
             }
 
       - name: Handle Failure
-        if: failure()
+        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
         uses: slackapi/slack-github-action@v1
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
